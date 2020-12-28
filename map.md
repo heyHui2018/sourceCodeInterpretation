@@ -1,5 +1,7 @@
 ### map
 
+***
+
 #### 0、概述
 map底层由hash表实现，数据存储在由桶组成的有序数组中，每个桶最多存放8个键值对，key的hash值(32位)的低位用于定位数组中的桶，高8位用于定位桶中的键值对。
 
@@ -58,7 +60,7 @@ func interhash(p unsafe.Pointer, h uintptr) uintptr {
 }
 ```
 
-#### 2、结构
+#### 2、结构体
 ```
 runtime/map.go
 type hmap struct {

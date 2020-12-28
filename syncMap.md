@@ -1,6 +1,12 @@
 ### sync.map
 
 ***
+
+#### 0、概述
+通过空间换时间即冗余两个数据结构(read/dirty)来实现。将读写分离到不同的map，read map提供并发读和已存元素的原子写，dirty map负责读写。
+故而read map可以在不加锁的情况下进行并发读，当read map中未读取到时，再加锁进行读取，并累计未命中数，当未命中数大于等于dirty map长度时，
+用dirty map覆盖read map。两个map的底层数据指针仍指向同一份值。
+
 #### 1、结构体
 ```
 type Map struct {
@@ -26,113 +32,7 @@ type entry struct {
 }
 ```
 
-#### 2、原理
-通过空间换时间即冗余两个数据结构(read/dirty)来实现。将读写分离到不同的map，read map提供并发读和已存元素的原子写，dirty map负责读写。
-故而read map可以在不加锁的情况下进行并发读，当read map中未读取到时，再加锁进行读取，并累计未命中数，当未命中数大于等于dirty map长度时，
-用dirty map覆盖read map。两个map的底层数据指针仍指向同一份值。
-
-#### 3、查询
-```
-func (m *Map) Load(key interface{}) (value interface{}, ok bool) {
-
-    // 查询read map
-    read, _ := m.read.Load().(readOnly)
-    e, ok := read.m[key]
-    
-    // read map中未读到且dirty map中有新数据，则查询dirty map
-    if !ok && read.amended {
-    
-        // 为dirty map加锁
-        m.mu.Lock()
-        
-        // 再次查询read map，主要防止在加锁的过程中,dirty map转换成read map,导致读取不到数据
-        read, _ = m.read.Load().(readOnly)
-        e, ok = read.m[key]
-        if !ok && read.amended {
-        
-            // 查询dirty map
-            e, ok = m.dirty[key]
-            
-            // 不论元素是否存在，均需记录miss数，以便dirty map升级为read map
-            m.missLocked()
-        }
-        
-        // 解锁
-        m.mu.Unlock()
-    }
-    
-    // 元素不存在则返回
-    if !ok {
-        return nil, false
-    }
-    return e.load()
-}
-
-func (m *Map) missLocked() {
-    m.misses++
-    
-    // 判断dirty map是否可升级为read map
-    if m.misses < len(m.dirty) {
-        return
-    }
-    
-    // dirty map升级为read map
-    m.read.Store(readOnly{m: m.dirty})
-    
-    // 清空dirty map
-    m.dirty = nil
-    
-    // 重置misses
-    m.misses = 0
-}
-```
-
-#### 4、删除
-```
-func (m *Map) Delete(key interface{}) {
-
-    // 查询read map
-    read, _ := m.read.Load().(readOnly)
-    e, ok := read.m[key]
-    
-    // read map中未读到且dirty map中有新数据，则查询dirty map，当read与dirty不同时amended为true即dirty中有read没有的新数据
-    if !ok && read.amended {
-        m.mu.Lock()
-        
-        // 再次查询read map，主要防止在加锁的过程中,dirty map转换成read map,导致读取不到数据
-        read, _ = m.read.Load().(readOnly)
-        e, ok = read.m[key]
-        if !ok && read.amended {
-        
-            // 直接删除
-            delete(m.dirty, key)
-        }
-        m.mu.Unlock()
-    }
-    
-    if ok {
-    
-        // 若read map中存在该key，则将其标记为nil（采用标记的方式删除！）
-        e.delete()
-    }
-}
-
-func (e *entry) delete() (hadValue bool) {
-    for {
-        p := atomic.LoadPointer(&e.p)
-        if p == nil || p == expunged {
-            return false
-        }
-        
-        // 原子操作
-        if atomic.CompareAndSwapPointer(&e.p, p, nil) {
-            return true
-        }
-    }
-}
-```
-
-#### 5、新增/修改
+#### 2、新增/修改
 ```
 func (m *Map) Store(key, value interface{}) {
 
@@ -251,9 +151,109 @@ func (e *entry) tryExpungeLocked() (isExpunged bool) {
 func (e *entry) storeLocked(i *interface{}) {
     atomic.StorePointer(&e.p, unsafe.Pointer(i))
 }
-
 ```
 
-#### 6、总结
+#### 3、查询
+```
+func (m *Map) Load(key interface{}) (value interface{}, ok bool) {
+
+    // 查询read map
+    read, _ := m.read.Load().(readOnly)
+    e, ok := read.m[key]
+    
+    // read map中未读到且dirty map中有新数据，则查询dirty map
+    if !ok && read.amended {
+    
+        // 为dirty map加锁
+        m.mu.Lock()
+        
+        // 再次查询read map，主要防止在加锁的过程中,dirty map转换成read map,导致读取不到数据
+        read, _ = m.read.Load().(readOnly)
+        e, ok = read.m[key]
+        if !ok && read.amended {
+        
+            // 查询dirty map
+            e, ok = m.dirty[key]
+            
+            // 不论元素是否存在，均需记录miss数，以便dirty map升级为read map
+            m.missLocked()
+        }
+        
+        // 解锁
+        m.mu.Unlock()
+    }
+    
+    // 元素不存在则返回
+    if !ok {
+        return nil, false
+    }
+    return e.load()
+}
+
+func (m *Map) missLocked() {
+    m.misses++
+    
+    // 判断dirty map是否可升级为read map
+    if m.misses < len(m.dirty) {
+        return
+    }
+    
+    // dirty map升级为read map
+    m.read.Store(readOnly{m: m.dirty})
+    
+    // 清空dirty map
+    m.dirty = nil
+    
+    // 重置misses
+    m.misses = 0
+}
+```
+
+#### 4、删除
+```
+func (m *Map) Delete(key interface{}) {
+
+    // 查询read map
+    read, _ := m.read.Load().(readOnly)
+    e, ok := read.m[key]
+    
+    // read map中未读到且dirty map中有新数据，则查询dirty map，当read与dirty不同时amended为true即dirty中有read没有的新数据
+    if !ok && read.amended {
+        m.mu.Lock()
+        
+        // 再次查询read map，主要防止在加锁的过程中,dirty map转换成read map,导致读取不到数据
+        read, _ = m.read.Load().(readOnly)
+        e, ok = read.m[key]
+        if !ok && read.amended {
+        
+            // 直接删除
+            delete(m.dirty, key)
+        }
+        m.mu.Unlock()
+    }
+    
+    if ok {
+    
+        // 若read map中存在该key，则将其标记为nil（采用标记的方式删除！）
+        e.delete()
+    }
+}
+
+func (e *entry) delete() (hadValue bool) {
+    for {
+        p := atomic.LoadPointer(&e.p)
+        if p == nil || p == expunged {
+            return false
+        }
+        
+        // 原子操作
+        if atomic.CompareAndSwapPointer(&e.p, p, nil) {
+            return true
+        }
+    }
+}
+```
+
+#### 5、总结
 sync.map不适合同时存在大量读写的场景，大量写会导致read map查不到数据从而加锁读取dirty map，进而是dirty map升级为read map，最终导致性能下降。
 更适合append-only或大量读少量写场景。
